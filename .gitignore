@@ -1,0 +1,5 @@
+*.exe
+/mdns-aaaa-responder
+*.log
+*.json
+dist/
