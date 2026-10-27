@@ -43,7 +43,9 @@ func repTest(t *testing.T, avecA bool) *repondeur {
 }
 
 func preparerSansCarte(avecA bool) (*config, error) {
-	cfg := &config{nom: nomTest, ipv6: fausse, ttl: 3600, ttlRepli: 120, seuil: 5, fenetre: 10 * time.Second, toujours: map[string]bool{}}
+	_, lien, _ := net.ParseCIDR("192.0.2.0/24")
+	cfg := &config{nom: nomTest, ipv6: fausse, ttl: 3600, ttlRepli: 120, seuil: 5, fenetre: 10 * time.Second,
+		toujours: map[string]bool{}, reseau: lien}
 	if avecA {
 		cfg.ipv4 = net.IPv4(192, 0, 2, 41).To4()
 	}
@@ -247,7 +249,7 @@ func TestRepliSiRafalesRepeteesMalgreLUnicast(t *testing.T) {
 		}
 		e = e[:0]
 	}
-	if !t0.Add(4 * time.Minute).Before(r.multicastJusqua["192.0.2.81"]) {
+	if !t0.Add(4 * time.Minute).Before(r.sources["192.0.2.81"].multicastJusqua) {
 		t.Fatal("repli multicast non memorise")
 	}
 	// La reponse multicast porte le TTL court de repli.
@@ -265,7 +267,7 @@ func TestRepliSiRafalesRepeteesMalgreLUnicast(t *testing.T) {
 
 func TestQUResteEnUnicastMemeEnRepli(t *testing.T) {
 	r := repTest(t, false)
-	r.multicastJusqua["192.0.2.81"] = t0.Add(time.Hour)
+	r.source("192.0.2.81", t0).multicastJusqua = t0.Add(time.Hour)
 	r.cfg.toujours["192.0.2.81"] = true
 	e := r.traiter(questionDe(nomTest, typeAAAA, classIN, true), amazon, t0)
 	if len(e) != 1 || e[0].dest != amazon {
@@ -338,7 +340,7 @@ func TestMacAbsenteRetombeSurLaRegleNormale(t *testing.T) {
 
 func TestSourceReconnueServieDesUneQuestionIsolee(t *testing.T) {
 	r := repTest(t, false)
-	r.multicastJusqua["192.0.2.81"] = t0.Add(time.Hour)
+	r.source("192.0.2.81", t0).multicastJusqua = t0.Add(time.Hour)
 	// Demande de renouvellement isolee, apres un long calme.
 	e := r.traiter(q(nomTest), amazon, t0.Add(30*time.Minute))
 	if len(e) != 1 || e[0].dest != groupeMDNS {
@@ -369,7 +371,7 @@ func TestPlusieursVraiesAAAASuiviesChacune(t *testing.T) {
 func TestFichierDEtat(t *testing.T) {
 	r := repTest(t, false)
 	r.cfg.etat = t.TempDir() + "/etat.json"
-	r.multicastJusqua["192.0.2.81"] = t0.Add(time.Hour)
+	r.source("192.0.2.81", t0).multicastJusqua = t0.Add(time.Hour)
 	r.ecrireEtat(t0)
 	b, err := os.ReadFile(r.cfg.etat)
 	if err != nil {
@@ -382,7 +384,7 @@ func TestFichierDEtat(t *testing.T) {
 	if err := json.Unmarshal(b, &e); err != nil || e.At == "" || len(e.Sources) != 1 || e.Sources[0] != "192.0.2.81" {
 		t.Fatalf("etat inattendu %s (%v)", b, err)
 	}
-	r.multicastJusqua["192.0.2.51"] = t0.Add(time.Hour)
+	r.source("192.0.2.51", t0).multicastJusqua = t0.Add(time.Hour)
 	r.ecrireEtat(t0.Add(5 * time.Second)) // trop tot : pas de reecriture
 	if b2, _ := os.ReadFile(r.cfg.etat); string(b2) != string(b) {
 		t.Fatal("reecriture avant 15 s")

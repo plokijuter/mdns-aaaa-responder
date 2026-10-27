@@ -12,5 +12,15 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -race -count=1 ./...
+      - run: go test -run '^$' -fuzz FuzzLireMessage -fuzztime 20s .
       - run: go build .
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: GOOS=linux GOARCH=arm64 go build -o /dev/null .
+      - run: GOOS=windows GOARCH=amd64 go build -o /dev/null .

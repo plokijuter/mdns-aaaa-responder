@@ -30,9 +30,13 @@
 //   - une source deja reconnue est servie des sa premiere question ;
 //   - au demarrage, et avec -retrait, un avis de retrait (TTL 0) efface
 //     l'adresse des caches (la premiere version la diffusait a tout le reseau) ;
-//   - une vraie AAAA publiee pour ce nom nous fait taire tant qu'au moins une
-//     est valide (TTL ou avis de retrait, chacune suivie a part) : NordVPN
-//     recoupe l'IPv6 en quelques secondes.
+//   - une vraie AAAA publiee pour ce nom (reponse mDNS valide, venue du lien
+//     choisi) nous fait taire tant qu'au moins une est valide, 1 h au plus
+//     chacune ; une IPv6 sur la carte choisie aussi ;
+//   - seuls les paquets de la carte choisie comptent (Linux : IP_MULTICAST_ALL
+//     coupe et carte d'arrivee verifiee ; partout : source dans son sous-reseau).
+//
+// Plates-formes prises en charge : Windows et Linux.
 package main
 
 import (
@@ -40,8 +44,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -50,6 +56,8 @@ var groupeMDNS = &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
 
 type config struct {
 	nom      string
+	ip4      net.IP     // adresse de ce PC sur le lien choisi
+	reseau   *net.IPNet // sous-reseau de cette adresse : seules ses sources comptent
 	ipv6     net.IP
 	ipv4     net.IP // nil = pas d'enregistrement A additionnel
 	ttl      uint32
@@ -62,7 +70,7 @@ type config struct {
 }
 
 type stats struct {
-	vues, servies, retenues, ignorees int
+	vues, servies, retenues, ignorees, rejetes int
 }
 
 func main() {
@@ -85,14 +93,16 @@ func main() {
 	macTest := flag.String("mac-de", "", "diagnostic : afficher la MAC (table ARP) de ces IPv4, separees par des virgules, puis quitter")
 	flag.Parse()
 
+	if *ip4 == "" {
+		log.Fatal("l'option -ip est obligatoire : adresse IPv4 de ce PC sur le reseau local (ex. -ip 192.168.1.10)")
+	}
 	if *macTest != "" {
+		cfg, err := preparer("x.local", *ip4, "fe80::1", 1, false)
+		if err != nil {
+			log.Fatal(err)
+		}
 		for _, s := range strings.Split(*macTest, ",") {
-			ip := net.ParseIP(strings.TrimSpace(s))
-			cfg, err := preparer("x.local", *ip4, "fe80::1", 1, false)
-			if err != nil {
-				log.Fatal(err)
-			}
-			mac := macDe(ip, cfg.carte.Index)
+			mac := macDe(net.ParseIP(strings.TrimSpace(s)), cfg.carte.Index)
 			fmt.Printf("%s MAC=%s amazon=%v (carte %s, index %d)\n", s, mac, estMacAmazon(mac), cfg.carte.Name, cfg.carte.Index)
 		}
 		return
@@ -109,8 +119,11 @@ func main() {
 		log.SetOutput(f)
 	}
 
-	if *ip4 == "" {
-		log.Fatal("l'option -ip est obligatoire : adresse IPv4 de ce PC sur le reseau local (ex. -ip 192.168.1.10)")
+	if *ttl > math.MaxInt32 || *ttlRepli > math.MaxInt32 {
+		log.Fatalf("-ttl et -ttl-repli : au plus %d s (RFC 2181)", math.MaxInt32)
+	}
+	if *seuil < 1 || *fenetre <= 0 {
+		log.Fatal("-seuil doit valoir au moins 1 et -fenetre etre positive")
 	}
 	cfg, err := preparer(*nom, *ip4, *ip6, uint32(*ttl), *avecA)
 	if err != nil {
@@ -119,9 +132,14 @@ func main() {
 	cfg.seuil, cfg.fenetre, cfg.ttlRepli = *seuil, *fenetre, uint32(*ttlRepli)
 	cfg.etat = *etat
 	for _, s := range strings.Split(*toujours, ",") {
-		if ip := net.ParseIP(strings.TrimSpace(s)).To4(); ip != nil {
-			cfg.toujours[ip.String()] = true
+		if s = strings.TrimSpace(s); s == "" {
+			continue
 		}
+		ip := net.ParseIP(s).To4()
+		if ip == nil {
+			log.Fatalf("-toujours : adresse IPv4 invalide %q", s)
+		}
+		cfg.toujours[ip.String()] = true
 	}
 	if *retrait {
 		if err := retirer(cfg); err != nil {
@@ -133,48 +151,92 @@ func main() {
 		if err := servir(cfg); err != nil {
 			log.Printf("erreur : %v ; nouvel essai dans 10 s", err)
 			time.Sleep(10 * time.Second)
+			// La carte a pu disparaitre, revenir ou changer d'index (VPN).
+			if carte, reseau, err := carteDe(cfg.ip4); err == nil {
+				cfg.carte, cfg.reseau = carte, reseau
+			}
 		}
 	}
+}
+
+// nomValide verifie un nom DNS en .local : etiquettes de 1 a 63 octets, 253 au total.
+func nomValide(nom string) bool {
+	if len(nom) > 253 || !strings.HasSuffix(nom, ".local") {
+		return false
+	}
+	for _, e := range strings.Split(nom, ".") {
+		if len(e) < 1 || len(e) > 63 {
+			return false
+		}
+	}
+	return true
 }
 
 func preparer(nom, ip4, ip6 string, ttl uint32, avecA bool) (*config, error) {
 	cfg := &config{nom: strings.ToLower(strings.TrimSuffix(nom, ".")), ttl: ttl,
 		ttlRepli: 120, seuil: 5, fenetre: 10 * time.Second, toujours: map[string]bool{}}
-	if cfg.nom == "" || !strings.HasSuffix(cfg.nom, ".local") {
-		return nil, fmt.Errorf("nom invalide %q (attendu : xxx.local)", nom)
+	if !nomValide(cfg.nom) {
+		return nil, fmt.Errorf("nom invalide %q (attendu : xxx.local, etiquettes de 1 a 63 caracteres)", nom)
 	}
-	if cfg.ipv6 = net.ParseIP(ip6); cfg.ipv6 == nil || cfg.ipv6.To4() != nil {
-		return nil, fmt.Errorf("adresse IPv6 invalide %q", ip6)
+	cfg.ipv6 = net.ParseIP(ip6)
+	if cfg.ipv6 == nil || cfg.ipv6.To4() != nil || !cfg.ipv6.IsLinkLocalUnicast() {
+		return nil, fmt.Errorf("adresse IPv6 %q refusee : il faut une adresse unicast lien-local (fe80::/10)", ip6)
 	}
-	v4 := net.ParseIP(ip4).To4()
-	if v4 == nil {
+	if adrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range adrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(cfg.ipv6) {
+				return nil, fmt.Errorf("adresse IPv6 %s deja portee par une carte de ce PC : en choisir une autre", ip6)
+			}
+		}
+	}
+	cfg.ip4 = net.ParseIP(ip4).To4()
+	if cfg.ip4 == nil {
 		return nil, fmt.Errorf("adresse IPv4 invalide %q", ip4)
 	}
 	if avecA {
-		cfg.ipv4 = v4
+		cfg.ipv4 = cfg.ip4
 	}
-	carte, err := carteDe(v4)
+	carte, reseau, err := carteDe(cfg.ip4)
 	if err != nil {
 		return nil, err
 	}
-	cfg.carte = carte
+	cfg.carte, cfg.reseau = carte, reseau
 	return cfg, nil
 }
 
-func carteDe(ip net.IP) (*net.Interface, error) {
+// carteDe rend la carte qui porte ip, et le sous-reseau de cette adresse.
+func carteDe(ip net.IP) (*net.Interface, *net.IPNet, error) {
 	cartes, err := net.Interfaces()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for i := range cartes {
 		adrs, _ := cartes[i].Addrs()
 		for _, a := range adrs {
 			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
-				return &cartes[i], nil
+				return &cartes[i], &net.IPNet{IP: n.IP.Mask(n.Mask), Mask: n.Mask}, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("aucune carte ne porte %s", ip)
+	return nil, nil, fmt.Errorf("aucune carte ne porte %s", ip)
+}
+
+// ipv6SurCarte dit si la carte choisie porte deja une adresse IPv6 : Windows
+// (ou Avahi) repond alors lui-meme par une vraie AAAA, on doit se taire.
+func ipv6SurCarte(carte *net.Interface) bool {
+	if carte == nil {
+		return false
+	}
+	adrs, err := carte.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range adrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() == nil && n.IP.To16() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func ecouter(cfg *config) (*net.UDPConn, error) {
@@ -183,7 +245,7 @@ func ecouter(cfg *config) (*net.UDPConn, error) {
 		return nil, err
 	}
 	if err := regler(conn); err != nil {
-		log.Printf("reglage TTL multicast impossible : %v", err)
+		log.Printf("reglage du socket incomplet : %v", err)
 	}
 	return conn, nil
 }
@@ -214,41 +276,55 @@ func servir(cfg *config) error {
 		return err
 	}
 	defer conn.Close()
-	// Efface des caches l'adresse diffusee a tous par la premiere version.
+	// Efface des caches une adresse diffusee avant ce demarrage.
 	annoncerRetrait(conn, cfg)
-	log.Printf("pret : %s AAAA %s (ttl %d s) sur %s, en unicast aux sources a >= %d questions en %s",
-		cfg.nom, cfg.ipv6, cfg.ttl, cfg.carte.Name, cfg.seuil, cfg.fenetre)
+	log.Printf("pret : %s AAAA %s (ttl %d s) sur %s (%s), en unicast aux sources a >= %d questions en %s",
+		cfg.nom, cfg.ipv6, cfg.ttl, cfg.carte.Name, cfg.reseau, cfg.seuil, cfg.fenetre)
 
 	r := newRepondeur(cfg)
+	r.ipv6Locale = ipv6SurCarte(cfg.carte)
 	buf := make([]byte, 9000)
+	oob := make([]byte, 256)
 	bilan := time.Now()
 	for {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, src, err := conn.ReadFromUDP(buf)
+		n, oobn, _, src, err := conn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
 				return err
 			}
+		} else if idx, ok := carteArrivee(oob[:oobn]); ok && idx != cfg.carte.Index {
+			r.s.rejetes++ // paquet arrive par une autre carte
 		} else {
 			for _, e := range r.traiter(buf[:n], src, time.Now()) {
 				if _, err := conn.WriteToUDP(e.data, e.dest); err != nil {
 					log.Printf("envoi vers %s : %v", e.dest, err)
 				}
 			}
-			for _, m := range r.messages {
-				log.Print(m)
-			}
-			r.messages = r.messages[:0]
 		}
+		for _, m := range r.messages {
+			log.Print(m)
+		}
+		r.messages = r.messages[:0]
 		r.ecrireEtat(time.Now())
 		if time.Since(bilan) >= time.Minute {
-			if s := r.s; s.vues > 0 {
-				log.Printf("bilan 1 min : %d questions AAAA, %d servies, %d retenues (1/s/source max), %d sous le seuil",
-					s.vues, s.servies, s.retenues, s.ignorees)
+			if s := r.s; s.vues > 0 || s.rejetes > 0 {
+				log.Printf("bilan 1 min : %d questions AAAA, %d servies, %d retenues (1/s max), %d sous le seuil, %d paquets hors lien",
+					s.vues, s.servies, s.retenues, s.ignorees, s.rejetes)
 			}
 			r.precedent = r.s
 			r.s = stats{}
 			bilan = time.Now()
+			r.purger(bilan)
+			// La carte a-t-elle change (disparition, nouvel index, IPv6 apparue) ?
+			carte, _, err := carteDe(cfg.ip4)
+			if err != nil || carte.Index != cfg.carte.Index {
+				return fmt.Errorf("carte de %s changee ou absente", cfg.ip4)
+			}
+			if v := ipv6SurCarte(carte); v != r.ipv6Locale {
+				r.ipv6Locale = v
+				log.Printf("IPv6 sur la carte %s : %v", carte.Name, v)
+			}
 		}
 	}
 }
@@ -258,32 +334,50 @@ type envoi struct {
 	dest *net.UDPAddr
 }
 
-type repondeur struct {
-	cfg             *config
-	rep             []byte
-	comptes         map[string][]time.Time // questions recentes par IP source
-	derniers        map[string]time.Time   // dernier envoi par adresse destination
-	signales        map[string]bool        // sources deja annoncees « en boucle » au journal
-	servis          map[string]int         // reponses unicast d'affilee a une source qui boucle
-	dernierService  map[string]time.Time
-	multicastJusqua map[string]time.Time // sources en repli multicast, et jusqu'a quand
-	repRepli        []byte               // meme reponse, TTL court, pour le multicast
-	vraies          map[string]time.Time // vraies AAAA publiees par d'autres, et leur expiration
-	silence         bool                 // au moins une vraie AAAA valide : on se tait
-	amazon          map[string]verdict   // appareils Amazon reconnus par leur MAC (cache)
-	mac             func(net.IP) net.HardwareAddr
-	s               stats
-	precedent       stats     // bilan de la minute precedente, pour le fichier d'etat
-	etatEcrit       time.Time // derniere ecriture du fichier d'etat
-	messages        []string
+// source : tout ce qu'on sait d'un demandeur, en un seul endroit (borne et purge).
+type source struct {
+	questions       []time.Time // questions recentes, au plus cfg.seuil
+	vu              time.Time   // derniere question
+	dernierEnvoi    time.Time   // derniere reponse qui lui a ete destinee
+	signale         bool        // deja annonce « en boucle » au journal
+	servis          int         // reponses unicast d'affilee pendant la boucle en cours
+	dernierService  time.Time
+	multicastJusqua time.Time // repli multicast en cours, jusqu'a quand
+	amazon          verdict
 }
+
+type repondeur struct {
+	cfg              *config
+	rep              []byte
+	repRepli         []byte // meme reponse, TTL court, pour le multicast
+	sources          map[string]*source
+	dernierMulticast time.Time
+	vraies           map[string]time.Time // vraies AAAA publiees par d'autres, et leur expiration
+	silence          bool                 // au moins une vraie AAAA valide : on se tait
+	ipv6Locale       bool                 // la carte choisie porte une IPv6 : on se tait
+	mac              func(net.IP) net.HardwareAddr
+	s                stats
+	precedent        stats     // bilan de la minute precedente, pour le fichier d'etat
+	etatEcrit        time.Time // derniere ecriture du fichier d'etat
+	erreurEtat       string    // derniere erreur d'ecriture du fichier d'etat (journalisee une fois)
+	messages         []string
+}
+
+const (
+	repliApres  = 10               // reponses unicast d'affilee sans effet avant le repli
+	memoire     = 15 * time.Minute // une nouvelle boucle dans ce delai trahit l'unicast ignore
+	dureeRepli  = time.Hour        // duree du repli multicast d'une source
+	silenceMax  = time.Hour        // une vraie AAAA ne nous fait pas taire plus longtemps sans etre redite
+	oubliSource = 2 * time.Hour    // une source muette depuis aussi longtemps est oubliee
+	maxSources  = 4096             // plafond global des sources suivies
+	maxVraies   = 64               // plafond des vraies AAAA suivies
+	ttlIP       = 255              // TTL IP de tout envoi (RFC 6762 §11 : SHOULD, pour les clients qui le verifient)
+)
 
 func newRepondeur(cfg *config) *repondeur {
 	return &repondeur{cfg: cfg, rep: reponse(cfg.nom, cfg.ipv6, cfg.ipv4, cfg.ttl, nil),
 		repRepli: reponse(cfg.nom, cfg.ipv6, cfg.ipv4, cfg.ttlRepli, nil),
-		comptes:  map[string][]time.Time{}, derniers: map[string]time.Time{}, signales: map[string]bool{},
-		servis: map[string]int{}, dernierService: map[string]time.Time{}, multicastJusqua: map[string]time.Time{},
-		vraies: map[string]time.Time{}, amazon: map[string]verdict{},
+		sources:  map[string]*source{}, vraies: map[string]time.Time{},
 		mac: func(ip net.IP) net.HardwareAddr {
 			if cfg.carte == nil {
 				return nil
@@ -292,9 +386,55 @@ func newRepondeur(cfg *config) *repondeur {
 		}}
 }
 
+// surLeLien dit si ip appartient au sous-reseau de la carte choisie.
+func (r *repondeur) surLeLien(ip net.IP) bool {
+	return r.cfg.reseau == nil || r.cfg.reseau.Contains(ip)
+}
+
+func (r *repondeur) source(ip string, t time.Time) *source {
+	s := r.sources[ip]
+	if s == nil {
+		if len(r.sources) >= maxSources {
+			r.purger(t)
+		}
+		s = &source{}
+		r.sources[ip] = s
+	}
+	return s
+}
+
+// purger oublie les sources muettes depuis oubliSource (sauf repli en cours)
+// et, au-dela du plafond, les plus anciennes ; puis les vraies AAAA expirees.
+func (r *repondeur) purger(t time.Time) {
+	for ip, s := range r.sources {
+		if t.Sub(s.vu) > oubliSource && !t.Before(s.multicastJusqua) {
+			delete(r.sources, ip)
+		}
+	}
+	if len(r.sources) >= maxSources {
+		ips := make([]string, 0, len(r.sources))
+		for ip := range r.sources {
+			ips = append(ips, ip)
+		}
+		sort.Slice(ips, func(i, j int) bool { return r.sources[ips[i]].vu.Before(r.sources[ips[j]].vu) })
+		for _, ip := range ips[:len(ips)-maxSources*3/4] {
+			delete(r.sources, ip)
+		}
+	}
+	for k, fin := range r.vraies {
+		if !t.Before(fin) {
+			delete(r.vraies, k)
+		}
+	}
+}
+
 // traiter decide des envois pour un paquet recu : rien pour les sources qui ne
 // bouclent pas, au plus un envoi par seconde par destination (RFC 6762 §6).
 func (r *repondeur) traiter(paquet []byte, src *net.UDPAddr, t time.Time) []envoi {
+	if !r.surLeLien(src.IP) {
+		r.s.rejetes++
+		return nil
+	}
 	m, err := lireMessage(paquet)
 	if err != nil {
 		return nil
@@ -303,76 +443,93 @@ func (r *repondeur) traiter(paquet []byte, src *net.UDPAddr, t time.Time) []envo
 		r.observer(m, src, t)
 		return nil
 	}
-	if r.enSilence(t) {
+	if m.opcode != 0 || r.enSilence(t) {
 		return nil
 	}
-	ok, qu := demandeAAAA(m, r.cfg.nom)
+	q, ok := demandeAAAA(m, r.cfg.nom)
 	if !ok {
 		return nil
 	}
 	r.s.vues++
 	ip := src.IP.String()
+	s := r.source(ip, t)
+	s.vu = t
 	// Une source deja reconnue (listee, produit Amazon, ou deja passee en
 	// multicast) est servie des sa premiere question : ses demandes de
 	// renouvellement apres un calme ne doivent pas attendre une nouvelle rafale.
-	if r.estAmazon(src.IP, t) && !t.Before(r.multicastJusqua[ip]) {
-		r.multicastJusqua[ip] = t.Add(dureeRepli)
+	if r.estAmazon(s, src.IP, t) && !t.Before(s.multicastJusqua) {
+		s.multicastJusqua = t.Add(dureeRepli)
 	}
-	connue := r.cfg.toujours[ip] || t.Before(r.multicastJusqua[ip])
-	if !r.enBoucle(ip, t) && !connue {
+	connue := r.cfg.toujours[ip] || t.Before(s.multicastJusqua)
+	if !r.enBoucle(s, ip, t) && !connue {
 		r.s.ignorees++
 		return nil
 	}
-	if t.Sub(r.derniers[src.String()]) < time.Second {
+	if t.Sub(s.dernierEnvoi) < time.Second {
 		r.s.retenues++
 		return nil
 	}
-	if len(r.derniers) > 1024 {
-		r.derniers = map[string]time.Time{}
-	}
-	r.derniers[src.String()] = t
-	r.s.servies++
-	if src.Port != 5353 {
+	var e []envoi
+	switch {
+	case src.Port != 5353:
 		// Requete « classique » : identifiant et question repris, TTL court.
-		return []envoi{{reponse(r.cfg.nom, r.cfg.ipv6, r.cfg.ipv4, r.cfg.ttl, &requete{id: m.id}), src}}
-	}
-	if qu {
+		e = []envoi{{reponse(r.cfg.nom, r.cfg.ipv6, r.cfg.ipv4, r.cfg.ttl, &requete{id: m.id, q: q}), src}}
+	case q.unicast:
 		// Le demandeur a lui-meme demande l'unicast : pas de repli.
-		return []envoi{{r.rep, src}}
+		e = []envoi{{r.rep, src}}
+	default:
+		e = r.servirQM(s, ip, t, src)
 	}
-	// Repli : une source qui boucle encore apres repliApres reponses unicast
-	// d'affilee, ou qui REBOUCLE alors qu'on lui a deja repondu en unicast il y
-	// a moins de memoire, n'accepte pas l'unicast (mesure du 26/10 : rafales de
-	// 700 a 1 100 questions toutes les 2 min, contre 8 questions/min avec la
-	// premiere version en multicast). On lui repond alors en multicast pendant
-	// dureeRepli, comme la premiere version, avec le TTL court de repli.
-	nouvelleBoucle := t.Sub(r.dernierService[ip]) > 2*r.cfg.fenetre
-	if nouvelleBoucle {
-		if !r.dernierService[ip].IsZero() && t.Sub(r.dernierService[ip]) < memoire && !t.Before(r.multicastJusqua[ip]) {
-			r.basculer(ip, t, "reboucle malgre l'unicast")
+	if len(e) == 0 {
+		r.s.retenues++
+		return nil
+	}
+	s.dernierEnvoi = t
+	r.s.servies++
+	return e
+}
+
+// servirQM : question multicast (QM). Unicast d'abord ; repli multicast pour
+// une source qui boucle encore apres repliApres reponses unicast d'affilee, ou
+// qui REBOUCLE alors qu'on lui a deja repondu en unicast il y a moins de
+// memoire : elle n'accepte pas l'unicast (mesure du 26/10 : rafales de 700 a
+// 1 100 questions toutes les 2 min, contre 8 questions/min en multicast).
+func (r *repondeur) servirQM(s *source, ip string, t time.Time, src *net.UDPAddr) []envoi {
+	if t.Sub(s.dernierService) > 2*r.cfg.fenetre {
+		if !s.dernierService.IsZero() && t.Sub(s.dernierService) < memoire && !t.Before(s.multicastJusqua) {
+			r.basculer(s, ip, t, "reboucle malgre l'unicast")
 		}
-		r.servis[ip] = 0
+		s.servis = 0
 	}
-	r.dernierService[ip] = t
-	r.servis[ip]++
-	if r.servis[ip] > repliApres && !t.Before(r.multicastJusqua[ip]) {
-		r.basculer(ip, t, fmt.Sprintf("boucle encore apres %d reponses unicast", repliApres))
+	s.dernierService = t
+	s.servis++
+	if s.servis > repliApres && !t.Before(s.multicastJusqua) {
+		r.basculer(s, ip, t, fmt.Sprintf("boucle encore apres %d reponses unicast", repliApres))
 	}
-	if t.Before(r.multicastJusqua[ip]) {
-		if t.Sub(r.derniers["multicast"]) < time.Second {
-			r.s.retenues++
+	if t.Before(s.multicastJusqua) {
+		// Un seul multicast par seconde, toutes sources confondues.
+		if t.Sub(r.dernierMulticast) < time.Second {
 			return nil
 		}
-		r.derniers["multicast"] = t
+		r.dernierMulticast = t
 		return []envoi{{r.repRepli, groupeMDNS}}
 	}
 	return []envoi{{r.rep, src}}
 }
 
+func (r *repondeur) basculer(s *source, ip string, t time.Time, pourquoi string) {
+	s.multicastJusqua = t.Add(dureeRepli)
+	r.messages = append(r.messages, fmt.Sprintf("%s %s : repli en multicast (ttl %d s) pour %s", ip, pourquoi, r.cfg.ttlRepli, dureeRepli))
+}
+
 // observer suit les AAAA publiees par d'autres pour notre nom, chacune avec
-// son expiration : tant qu'une seule est valide, on se tait ; son avis de
-// retrait (TTL 0) l'oublie.
+// son expiration (plafonnee a silenceMax) : tant qu'une seule est valide, on se
+// tait ; son avis de retrait (TTL 0) l'oublie. Seules comptent les reponses
+// mDNS valides : port source 5353, opcode et rcode nuls, source sur le lien.
 func (r *repondeur) observer(m *message, src *net.UDPAddr, t time.Time) {
+	if src.Port != 5353 || m.opcode != 0 || m.rcode != 0 {
+		return
+	}
 	for _, a := range aaaaPubliees(m, r.cfg.nom) {
 		ip := net.IP(a.data)
 		if ip.Equal(r.cfg.ipv6) {
@@ -387,13 +544,20 @@ func (r *repondeur) observer(m *message, src *net.UDPAddr, t time.Time) {
 			continue
 		}
 		if _, ok := r.vraies[k]; !ok {
+			if len(r.vraies) >= maxVraies {
+				continue
+			}
 			r.messages = append(r.messages, fmt.Sprintf("vraie AAAA %s publiee par %s pour %s (ttl %d s)", k, src.IP, r.cfg.nom, a.ttl))
 		}
-		r.vraies[k] = t.Add(time.Duration(a.ttl) * time.Second)
+		duree := time.Duration(a.ttl) * time.Second
+		if duree > silenceMax {
+			duree = silenceMax
+		}
+		r.vraies[k] = t.Add(duree)
 	}
 }
 
-// enSilence oublie les vraies AAAA expirees et dit s'il en reste une valide.
+// enSilence oublie les vraies AAAA expirees et dit s'il faut se taire.
 func (r *repondeur) enSilence(t time.Time) bool {
 	for k, fin := range r.vraies {
 		if !t.Before(fin) {
@@ -401,10 +565,10 @@ func (r *repondeur) enSilence(t time.Time) bool {
 		}
 	}
 	avant := r.silence
-	r.silence = len(r.vraies) > 0
+	r.silence = len(r.vraies) > 0 || r.ipv6Locale
 	if avant != r.silence {
 		if r.silence {
-			r.messages = append(r.messages, "une vraie AAAA est valide : silence")
+			r.messages = append(r.messages, "une vraie AAAA est valide (ou la carte a une IPv6) : silence")
 		} else {
 			r.messages = append(r.messages, "plus aucune vraie AAAA valide : on reprend")
 		}
@@ -418,62 +582,43 @@ type verdict struct {
 	connu  bool // MAC trouvee dans la table ARP
 }
 
-// estAmazon dit si ip appartient a un appareil Amazon (prefixe MAC). Verdict
-// garde 10 min ; une MAC absente de la table ARP est recherchee a nouveau
-// apres 30 s.
-func (r *repondeur) estAmazon(ip net.IP, t time.Time) bool {
-	k := ip.String()
-	v, ok := r.amazon[k]
-	if ok && (t.Sub(v.quand) < 10*time.Minute && v.connu || t.Sub(v.quand) < 30*time.Second) {
+// estAmazon dit si la source appartient a un appareil Amazon (prefixe MAC).
+// Verdict garde 10 min ; une MAC absente de la table ARP est recherchee a
+// nouveau apres 30 s.
+func (r *repondeur) estAmazon(s *source, ip net.IP, t time.Time) bool {
+	v := s.amazon
+	if !v.quand.IsZero() && (t.Sub(v.quand) < 10*time.Minute && v.connu || t.Sub(v.quand) < 30*time.Second) {
 		return v.amazon
 	}
+	avant := v
 	v = verdict{quand: t}
 	if mac := r.mac(ip); len(mac) == 6 {
 		v.connu = true
 		v.amazon = estMacAmazon(mac)
-		if v.amazon && !(ok && v.amazon == r.amazon[k].amazon && r.amazon[k].connu) {
-			r.messages = append(r.messages, fmt.Sprintf("%s est un produit Amazon (MAC %s) : multicast d'emblee", k, mac))
+		if v.amazon && !(avant.connu && avant.amazon) {
+			r.messages = append(r.messages, fmt.Sprintf("%s est un produit Amazon (MAC %s) : multicast d'emblee", ip, mac))
 		}
 	}
-	if len(r.amazon) > 1024 {
-		r.amazon = map[string]verdict{}
-	}
-	r.amazon[k] = v
+	s.amazon = v
 	return v.amazon
 }
 
-const (
-	repliApres = 10               // reponses unicast d'affilee sans effet avant le repli
-	memoire    = 15 * time.Minute // une nouvelle boucle dans ce delai trahit l'unicast ignore
-	dureeRepli = time.Hour        // duree du repli multicast d'une source
-)
-
-func (r *repondeur) basculer(ip string, t time.Time, pourquoi string) {
-	r.multicastJusqua[ip] = t.Add(dureeRepli)
-	r.messages = append(r.messages, fmt.Sprintf("%s %s : repli en multicast (ttl %d s) pour %s", ip, pourquoi, r.cfg.ttlRepli, dureeRepli))
-}
-
 // enBoucle compte la question et dit si la source a atteint le seuil.
-func (r *repondeur) enBoucle(ip string, t time.Time) bool {
-	h := r.comptes[ip]
+func (r *repondeur) enBoucle(s *source, ip string, t time.Time) bool {
 	k := 0
-	for _, x := range h {
+	for _, x := range s.questions {
 		if t.Sub(x) < r.cfg.fenetre {
-			h[k] = x
+			s.questions[k] = x
 			k++
 		}
 	}
-	h = append(h[:k], t)
-	if len(h) > r.cfg.seuil {
-		h = h[len(h)-r.cfg.seuil:]
+	s.questions = append(s.questions[:k], t)
+	if len(s.questions) > r.cfg.seuil {
+		s.questions = s.questions[len(s.questions)-r.cfg.seuil:]
 	}
-	if len(r.comptes) > 1024 {
-		r.comptes = map[string][]time.Time{}
-	}
-	r.comptes[ip] = h
-	boucle := len(h) >= r.cfg.seuil
-	if boucle && !r.signales[ip] {
-		r.signales[ip] = true
+	boucle := len(s.questions) >= r.cfg.seuil
+	if boucle && !s.signale {
+		s.signale = true
 		r.messages = append(r.messages, fmt.Sprintf("%s pose la question en boucle (>= %d en %s)", ip, r.cfg.seuil, r.cfg.fenetre))
 	}
 	return boucle
@@ -482,34 +627,49 @@ func (r *repondeur) enBoucle(ip string, t time.Time) bool {
 // ecrireEtat reecrit le fichier d'etat lu par heal-stack (au plus une fois
 // toutes les 15 s ; la boucle se reveille au moins toutes les 30 s). Ecriture
 // dans un fichier temporaire puis renommage : jamais d'etat a moitie ecrit.
+// Une erreur d'ecriture est journalisee (une fois par erreur differente).
 func (r *repondeur) ecrireEtat(t time.Time) {
 	if r.cfg.etat == "" || t.Sub(r.etatEcrit) < 15*time.Second {
 		return
 	}
 	r.etatEcrit = t
-	var enRepli []string
-	for ip, fin := range r.multicastJusqua {
-		if t.Before(fin) {
+	enRepli := []string{}
+	for ip, s := range r.sources {
+		if t.Before(s.multicastJusqua) {
 			enRepli = append(enRepli, ip)
 		}
 	}
+	sort.Strings(enRepli)
 	e := map[string]any{
 		"at":                t.Format(time.RFC3339),
 		"nom":               r.cfg.nom,
 		"ipv6":              r.cfg.ipv6.String(),
 		"sources_multicast": enRepli,
+		"sources_suivies":   len(r.sources),
 		"silence":           r.silence,
 		"minute_precedente": map[string]int{
 			"questions": r.precedent.vues, "servies": r.precedent.servies,
 			"retenues": r.precedent.retenues, "sous_le_seuil": r.precedent.ignorees,
+			"hors_lien": r.precedent.rejetes,
 		},
 	}
 	b, err := json.Marshal(e)
-	if err != nil {
-		return
+	if err == nil {
+		tmp := r.cfg.etat + ".tmp"
+		if err = os.WriteFile(tmp, b, 0o644); err == nil {
+			err = os.Rename(tmp, r.cfg.etat)
+		}
 	}
-	tmp := r.cfg.etat + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err == nil {
-		os.Rename(tmp, r.cfg.etat)
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	if msg != r.erreurEtat {
+		if msg != "" {
+			log.Printf("fichier d'etat %s : %v", r.cfg.etat, err)
+		} else {
+			log.Printf("fichier d'etat %s : ecriture retablie", r.cfg.etat)
+		}
+		r.erreurEtat = msg
 	}
 }

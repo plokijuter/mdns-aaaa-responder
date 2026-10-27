@@ -30,14 +30,16 @@ const (
 
 type question struct {
 	nom     string // en minuscules, sans point final
+	brut    string // tel que recu (casse d'origine), pour le renvoyer
 	qtype   uint16
 	qclass  uint16 // sans le bit QU
 	unicast bool   // bit QU
 }
 
+// requete : ce qu'il faut reprendre dans une reponse « classique ».
 type requete struct {
-	id        uint16
-	questions []question
+	id uint16
+	q  question // la question qui nous concerne, renvoyee telle quelle
 }
 
 type rr struct {
@@ -50,7 +52,9 @@ type rr struct {
 
 type message struct {
 	id        uint16
-	reponse   bool // bit QR
+	reponse   bool  // bit QR
+	opcode    uint8 // 0 = requete standard
+	rcode     uint8 // 0 = pas d'erreur
 	questions []question
 	rrs       []rr // reponses, autorite et additionnels confondus
 }
@@ -65,6 +69,8 @@ func lireMessage(b []byte) (*message, error) {
 	m := &message{
 		id:      binary.BigEndian.Uint16(b[0:2]),
 		reponse: binary.BigEndian.Uint16(b[2:4])&0x8000 != 0,
+		opcode:  uint8(binary.BigEndian.Uint16(b[2:4]) >> 11 & 0xF),
+		rcode:   uint8(binary.BigEndian.Uint16(b[2:4]) & 0xF),
 	}
 	nq := int(binary.BigEndian.Uint16(b[4:6]))
 	nrr := int(binary.BigEndian.Uint16(b[6:8])) + int(binary.BigEndian.Uint16(b[8:10])) + int(binary.BigEndian.Uint16(b[10:12]))
@@ -79,7 +85,8 @@ func lireMessage(b []byte) (*message, error) {
 		}
 		qc := binary.BigEndian.Uint16(b[suite+2 : suite+4])
 		m.questions = append(m.questions, question{
-			nom:     nom,
+			nom:     strings.ToLower(nom),
+			brut:    nom,
 			qtype:   binary.BigEndian.Uint16(b[suite : suite+2]),
 			qclass:  qc &^ bitHaut,
 			unicast: qc&bitHaut != 0,
@@ -99,7 +106,7 @@ func lireMessage(b []byte) (*message, error) {
 			return nil, errMessage
 		}
 		m.rrs = append(m.rrs, rr{
-			nom:   nom,
+			nom:   strings.ToLower(nom),
 			rtype: binary.BigEndian.Uint16(b[suite : suite+2]),
 			class: binary.BigEndian.Uint16(b[suite+2 : suite+4]),
 			ttl:   binary.BigEndian.Uint32(b[suite+4 : suite+8]),
@@ -111,7 +118,7 @@ func lireMessage(b []byte) (*message, error) {
 }
 
 // lireNom lit un nom a la position pos, pointeurs de compression compris, et
-// rend la position qui suit le nom dans le message.
+// rend la position qui suit le nom dans le message. Le nom garde sa casse.
 func lireNom(b []byte, pos int) (string, int, error) {
 	var parts []string
 	suite := -1
@@ -125,7 +132,7 @@ func lireNom(b []byte, pos int) (string, int, error) {
 			if suite < 0 {
 				suite = pos + 1
 			}
-			return strings.ToLower(strings.Join(parts, ".")), suite, nil
+			return strings.Join(parts, "."), suite, nil
 		case l&0xC0 == 0xC0:
 			if pos+1 >= len(b) {
 				return "", 0, errMessage
@@ -188,9 +195,15 @@ func reponse(nom string, ipv6, ipv4 net.IP, ttl uint32, classique *requete) []by
 		binary.BigEndian.PutUint16(b[10:12], 1)
 	}
 	if classique != nil {
-		b = ecrireNom(b, nom)
-		b = binary.BigEndian.AppendUint16(b, typeAAAA)
-		b = binary.BigEndian.AppendUint16(b, classIN)
+		// La question est renvoyee telle qu'elle a ete posee (nom, type et
+		// classe, ANY compris) : un client classique verifie la correspondance.
+		qn := classique.q.brut
+		if qn == "" {
+			qn = nom
+		}
+		b = ecrireNom(b, qn)
+		b = binary.BigEndian.AppendUint16(b, classique.q.qtype)
+		b = binary.BigEndian.AppendUint16(b, classique.q.qclass)
 	}
 	b = ecrireRR(b, nom, typeAAAA, flush, ttl, ipv6.To16())
 	if ipv4 != nil {
@@ -199,16 +212,16 @@ func reponse(nom string, ipv6, ipv4 net.IP, ttl uint32, classique *requete) []by
 	return b
 }
 
-// demandeAAAA dit si le message demande l'AAAA (ou ANY) de nom en classe
-// Internet (ou ANY), et si une reponse unicast est souhaitee.
-func demandeAAAA(m *message, nom string) (bool, bool) {
+// demandeAAAA rend la question qui demande l'AAAA (ou ANY) de nom en classe
+// Internet (ou ANY), s'il y en a une.
+func demandeAAAA(m *message, nom string) (question, bool) {
 	for _, q := range m.questions {
 		if q.nom == nom && (q.qtype == typeAAAA || q.qtype == typeANY) &&
 			(q.qclass == classIN || q.qclass == classANY) {
-			return true, q.unicast
+			return q, true
 		}
 	}
-	return false, false
+	return question{}, false
 }
 
 // aaaaPubliees rend les enregistrements AAAA de classe Internet publies pour

@@ -39,8 +39,14 @@ Precautions, so the fake address stays out of the way:
 - **At most one answer per second** per destination, so it can never feed the storm.
 - QU questions get unicast; legacy queries (source port ≠ 5353) get the ID and question echoed, no cache-flush
   bit and a TTL ≤ 10 s (RFC 6762 §6.7). Only class IN or ANY is answered.
-- **Steps aside** while a real `AAAA` for the name is published by anyone (including the machine itself,
-  multicast loopback is enabled for that), until its TTL expires or it is withdrawn.
+- **Steps aside** while a real `AAAA` for the name is published (including by the machine itself, multicast
+  loopback is enabled for that), until its TTL expires (capped at 1 h) or it is withdrawn — and while the
+  selected adapter itself has an IPv6 address. Only valid mDNS responses count: source port 5353, opcode and
+  rcode 0, source on the selected link.
+- **Only the selected link counts.** Packets whose source is outside the adapter's subnet are ignored; on
+  Linux, `IP_MULTICAST_ALL` is turned off and the arrival interface of every packet is checked (`IP_PKTINFO`).
+- All answers are sent with **IP TTL 255**, unicast included (RFC 6762 §11).
+- Per-source state is bounded (4,096 sources) and forgotten after 2 h of silence.
 - On start-up, and with `-retrait`, it sends a **goodbye** (TTL 0) that clears the fake address from caches.
 
 Result on the network where it was written: from bursts of 700–1,100 questions every two minutes (and up to
@@ -109,7 +115,10 @@ GOOS=linux   GOARCH=amd64 go build -o mdns-aaaa-responder .
 GOOS=linux   GOARCH=arm64 go build -o mdns-aaaa-responder .   # Raspberry Pi 64-bit
 ```
 
-Tested in production on Windows; on Linux, unit tests plus an end-to-end mDNS test. Code comments are in French.
+Supported platforms: **Windows and Linux** (the ARP lookup used for Amazon detection exists only there).
+Tested in production on Windows. On Linux: unit and socket tests (TTL, `IP_MULTICAST_ALL`, arrival interface),
+a fuzz test of the DNS decoder, and an end-to-end mDNS test; coexistence with a running **Avahi daemon has not
+been validated yet**. Code comments are in French.
 
 ## Limits
 

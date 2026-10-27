@@ -1,31 +1,31 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
 import (
+	"errors"
 	"net"
 	"syscall"
 )
 
-// regler impose le TTL IP 255 exige pour le mDNS (RFC 6762 §11) et
-// retablit le retour local du multicast.
+// regler : TTL IP 255 et retour local du multicast. Plate-forme non prise en
+// charge officiellement (seuls Windows et Linux le sont).
 func regler(c *net.UDPConn) error {
 	rc, err := c.SyscallConn()
 	if err != nil {
 		return err
 	}
-	var e error
+	var errs []error
 	err = rc.Control(func(fd uintptr) {
-		e = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, 255)
-		if e == nil {
-			// Go coupe le retour local du multicast ; sous Windows cela empeche
-			// aussi de RECEVOIR ce que la machine elle-meme emet. Or il faut voir
-			// une vraie AAAA annoncee par Windows.
-			e = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_LOOP, 1)
-		}
+		f := int(fd)
+		errs = append(errs,
+			syscall.SetsockoptInt(f, syscall.IPPROTO_IP, syscall.IP_TTL, ttlIP),
+			syscall.SetsockoptInt(f, syscall.IPPROTO_IP, syscall.IP_MULTICAST_TTL, ttlIP))
 	})
 	if err != nil {
 		return err
 	}
-	return e
+	return errors.Join(errs...)
 }
+
+func carteArrivee(oob []byte) (int, bool) { return 0, false }
