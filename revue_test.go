@@ -123,12 +123,20 @@ func TestStatistiquesExactes(t *testing.T) {
 	}
 }
 
-func TestIPv6SurLaCarteFaitTaire(t *testing.T) {
+func TestIPv6SurLaCarteFaitTaireEtReprendVite(t *testing.T) {
 	r := repTest(t, false)
 	r.cfg.toujours["192.0.2.81"] = true
-	r.ipv6Locale = true
+	ipv6 := true
+	r.ipv6Carte = func() bool { return ipv6 }
 	if len(r.traiter(q(nomTest), amazon, t0)) != 0 {
 		t.Fatal("reponse alors que la carte porte une vraie IPv6")
+	}
+	ipv6 = false // NordVPN recoupe l'IPv6
+	if len(r.traiter(q(nomTest), amazon, t0.Add(1500*time.Millisecond))) != 0 {
+		t.Fatal("verification plus frequente que toutes les 2 s")
+	}
+	if len(r.traiter(q(nomTest), amazon, t0.Add(2*time.Second))) != 1 {
+		t.Fatal("pas de reprise 2 s apres la disparition de l'IPv6")
 	}
 }
 

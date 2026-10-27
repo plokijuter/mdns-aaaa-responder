@@ -97,13 +97,18 @@ func main() {
 		log.Fatal("l'option -ip est obligatoire : adresse IPv4 de ce PC sur le reseau local (ex. -ip 192.168.1.10)")
 	}
 	if *macTest != "" {
-		cfg, err := preparer("x.local", *ip4, "fe80::1", 1, false)
+		// Diagnostic de la table ARP seulement : aucune validation de l'IPv6.
+		v4 := net.ParseIP(*ip4).To4()
+		if v4 == nil {
+			log.Fatalf("adresse IPv4 invalide %q", *ip4)
+		}
+		carte, _, err := carteDe(v4)
 		if err != nil {
 			log.Fatal(err)
 		}
 		for _, s := range strings.Split(*macTest, ",") {
-			mac := macDe(net.ParseIP(strings.TrimSpace(s)), cfg.carte.Index)
-			fmt.Printf("%s MAC=%s amazon=%v (carte %s, index %d)\n", s, mac, estMacAmazon(mac), cfg.carte.Name, cfg.carte.Index)
+			mac := macDe(net.ParseIP(strings.TrimSpace(s)), carte.Index)
+			fmt.Printf("%s MAC=%s amazon=%v (carte %s, index %d)\n", s, mac, estMacAmazon(mac), carte.Name, carte.Index)
 		}
 		return
 	}
@@ -282,7 +287,7 @@ func servir(cfg *config) error {
 		cfg.nom, cfg.ipv6, cfg.ttl, cfg.carte.Name, cfg.reseau, cfg.seuil, cfg.fenetre)
 
 	r := newRepondeur(cfg)
-	r.ipv6Locale = ipv6SurCarte(cfg.carte)
+	r.rafraichirIPv6(time.Now())
 	buf := make([]byte, 9000)
 	oob := make([]byte, 256)
 	bilan := time.Now()
@@ -302,6 +307,7 @@ func servir(cfg *config) error {
 				}
 			}
 		}
+		r.rafraichirIPv6(time.Now())
 		for _, m := range r.messages {
 			log.Print(m)
 		}
@@ -316,14 +322,10 @@ func servir(cfg *config) error {
 			r.s = stats{}
 			bilan = time.Now()
 			r.purger(bilan)
-			// La carte a-t-elle change (disparition, nouvel index, IPv6 apparue) ?
+			// La carte a-t-elle change (disparition, nouvel index) ?
 			carte, _, err := carteDe(cfg.ip4)
 			if err != nil || carte.Index != cfg.carte.Index {
 				return fmt.Errorf("carte de %s changee ou absente", cfg.ip4)
-			}
-			if v := ipv6SurCarte(carte); v != r.ipv6Locale {
-				r.ipv6Locale = v
-				log.Printf("IPv6 sur la carte %s : %v", carte.Name, v)
 			}
 		}
 	}
@@ -355,6 +357,8 @@ type repondeur struct {
 	vraies           map[string]time.Time // vraies AAAA publiees par d'autres, et leur expiration
 	silence          bool                 // au moins une vraie AAAA valide : on se tait
 	ipv6Locale       bool                 // la carte choisie porte une IPv6 : on se tait
+	ipv6Vu           time.Time            // derniere verification de ipv6Locale
+	ipv6Carte        func() bool          // lit si la carte choisie porte une IPv6
 	mac              func(net.IP) net.HardwareAddr
 	s                stats
 	precedent        stats     // bilan de la minute precedente, pour le fichier d'etat
@@ -378,6 +382,7 @@ func newRepondeur(cfg *config) *repondeur {
 	return &repondeur{cfg: cfg, rep: reponse(cfg.nom, cfg.ipv6, cfg.ipv4, cfg.ttl, nil),
 		repRepli: reponse(cfg.nom, cfg.ipv6, cfg.ipv4, cfg.ttlRepli, nil),
 		sources:  map[string]*source{}, vraies: map[string]time.Time{},
+		ipv6Carte: func() bool { return ipv6SurCarte(cfg.carte) },
 		mac: func(ip net.IP) net.HardwareAddr {
 			if cfg.carte == nil {
 				return nil
@@ -443,6 +448,7 @@ func (r *repondeur) traiter(paquet []byte, src *net.UDPAddr, t time.Time) []envo
 		r.observer(m, src, t)
 		return nil
 	}
+	r.rafraichirIPv6(t)
 	if m.opcode != 0 || r.enSilence(t) {
 		return nil
 	}
@@ -554,6 +560,21 @@ func (r *repondeur) observer(m *message, src *net.UDPAddr, t time.Time) {
 			duree = silenceMax
 		}
 		r.vraies[k] = t.Add(duree)
+	}
+}
+
+// rafraichirIPv6 relit, au plus toutes les 2 s, si la carte choisie porte une
+// IPv6. Assez souvent pour que la reprise suive de pres sa disparition : NordVPN
+// recoupe l'IPv6 en 2 a 5 s, et chaque seconde de silence laisse la tempete
+// repartir (revue du 27/10 : 62 s mesurees avec un controle par minute).
+func (r *repondeur) rafraichirIPv6(t time.Time) {
+	if !r.ipv6Vu.IsZero() && t.Sub(r.ipv6Vu) < 2*time.Second {
+		return
+	}
+	r.ipv6Vu = t
+	if v := r.ipv6Carte(); v != r.ipv6Locale {
+		r.ipv6Locale = v
+		r.messages = append(r.messages, fmt.Sprintf("IPv6 sur la carte choisie : %v", v))
 	}
 }
 
